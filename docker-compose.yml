@@ -1,0 +1,14 @@
+services:
+  estoque:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - NODE_ENV=production
+    ports:
+      - "3000:3000"
+    volumes:
+      - estoque_data:/app/data
+
+volumes:
+  estoque_data:
