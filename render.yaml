@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: estoque-pro-v21
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DB_PATH
+        value: /app/data/estoque.db
+      - key: ADMIN_USERNAME
+        value: REDWAY_MASTER
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_MODEL
+        value: gpt-5.6-luna
+      - key: REQUIRE_SIGNATURE
+        value: "true"
+    disk:
+      name: estoque-pro-v21-data
+      mountPath: /app/data
+      sizeGB: 1

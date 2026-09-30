@@ -1,289 +1,87 @@
-const express = require("express");
-const session = require("express-session");
-const bcrypt = require("bcryptjs");
-const Database = require("better-sqlite3");
-const path = require("path");
-const OpenAI = require("openai");
+const express=require('express');
+const bcrypt=require('bcryptjs');
+const Database=require('better-sqlite3');
+const crypto=require('crypto');
+const path=require('path');
 
-const app = express();
-if (process.env.NODE_ENV === "production") app.set("trust proxy", 1);
-app.disable("x-powered-by");
-app.use((req,res,next)=>{
-  res.setHeader("X-Content-Type-Options","nosniff");
-  res.setHeader("X-Frame-Options","DENY");
-  res.setHeader("Referrer-Policy","strict-origin-when-cross-origin");
-  next();
-});
-const PORT = process.env.PORT || 3000;
-const db = new Database(path.join(__dirname, process.env.DB_PATH || "estoque.db"));
+const app=express();
+const PORT=process.env.PORT||3000;
+const DB_PATH=process.env.DB_PATH||path.join(__dirname,'data','estoque.db');
+const db=new Database(DB_PATH);
+db.pragma('journal_mode = WAL');
+db.pragma('foreign_keys = ON');
+app.disable('x-powered-by');
+app.use((req,res,next)=>{res.setHeader('X-Content-Type-Options','nosniff');res.setHeader('X-Frame-Options','DENY');res.setHeader('Referrer-Policy','strict-origin-when-cross-origin');res.setHeader('Permissions-Policy','microphone=(self)');next()});
+app.use(express.json({limit:'3mb'}));
+app.use(express.static(path.join(__dirname,'public')));
 
-app.use(express.json());
-app.use(express.static(path.join(__dirname, "public")));
-app.use(session({
-  secret: process.env.SESSION_SECRET || "dev-secret-change-me",
-  resave: false,
-  saveUninitialized: false,
-  cookie: {
-    httpOnly: true,
-    sameSite: "lax",
-    secure: process.env.NODE_ENV === "production",
-    maxAge: 8*60*60*1000
-  }
-}));
+const schema=`
+CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,username TEXT UNIQUE NOT NULL,password_hash TEXT NOT NULL,role TEXT NOT NULL CHECK(role IN ('ADMIN','ESTOQUISTA','CONSULTA')),active INTEGER NOT NULL DEFAULT 1,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,last_login TEXT);
+CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY,user_id INTEGER NOT NULL,expires_at INTEGER NOT NULL,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE);
+CREATE TABLE IF NOT EXISTS products(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,variant TEXT NOT NULL DEFAULT 'PADRÃO',code TEXT,unit TEXT NOT NULL DEFAULT 'UN',qty REAL NOT NULL DEFAULT 0,min_qty REAL NOT NULL DEFAULT 0,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS movements(id INTEGER PRIMARY KEY AUTOINCREMENT,product_id INTEGER NOT NULL,type TEXT NOT NULL CHECK(type IN ('IN','OUT','ADJUST','REVERSAL')),qty REAL NOT NULL,oc TEXT,cut_qty REAL,note TEXT,user_id INTEGER,signature TEXT,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,FOREIGN KEY(product_id) REFERENCES products(id),FOREIGN KEY(user_id) REFERENCES users(id));
+CREATE TABLE IF NOT EXISTS reservations(id INTEGER PRIMARY KEY AUTOINCREMENT,oc TEXT NOT NULL,product_id INTEGER NOT NULL,qty REAL NOT NULL,status TEXT NOT NULL DEFAULT 'ATIVA',user_id INTEGER,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,cancelled_at TEXT,FOREIGN KEY(product_id) REFERENCES products(id),FOREIGN KEY(user_id) REFERENCES users(id));
+CREATE TABLE IF NOT EXISTS fichas(id INTEGER PRIMARY KEY AUTOINCREMENT,number TEXT UNIQUE,oc TEXT,office TEXT,description TEXT,pieces INTEGER DEFAULT 0,status TEXT NOT NULL DEFAULT 'EM ABERTO',data_json TEXT NOT NULL DEFAULT '{}',created_by INTEGER,updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,FOREIGN KEY(created_by) REFERENCES users(id));
+CREATE TABLE IF NOT EXISTS occurrences(id INTEGER PRIMARY KEY AUTOINCREMENT,ficha_id INTEGER,oc TEXT,title TEXT NOT NULL,description TEXT,status TEXT NOT NULL DEFAULT 'ABERTA',user_id INTEGER,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,resolved_at TEXT,FOREIGN KEY(ficha_id) REFERENCES fichas(id),FOREIGN KEY(user_id) REFERENCES users(id));
+CREATE TABLE IF NOT EXISTS audits(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER,action TEXT NOT NULL,entity TEXT,entity_id INTEGER,details TEXT,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,FOREIGN KEY(user_id) REFERENCES users(id));
+CREATE TABLE IF NOT EXISTS settings(k TEXT PRIMARY KEY,v TEXT NOT NULL);
+`;
+db.exec(schema);
 
-db.exec(`
-CREATE TABLE IF NOT EXISTS users (
- id INTEGER PRIMARY KEY AUTOINCREMENT,
- name TEXT NOT NULL,
- username TEXT UNIQUE NOT NULL,
- password_hash TEXT NOT NULL,
- role TEXT NOT NULL CHECK(role IN ('admin','user')),
- created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
- active INTEGER NOT NULL DEFAULT 1
-);
-CREATE TABLE IF NOT EXISTS products (
- id INTEGER PRIMARY KEY AUTOINCREMENT,
- name TEXT NOT NULL,
- variant TEXT NOT NULL DEFAULT 'Padrão',
- qty INTEGER NOT NULL DEFAULT 0,
- min_qty INTEGER NOT NULL DEFAULT 0,
- created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
- active INTEGER NOT NULL DEFAULT 1
-);
-CREATE TABLE IF NOT EXISTS movements (
- id INTEGER PRIMARY KEY AUTOINCREMENT,
- product_id INTEGER,
- type TEXT NOT NULL CHECK(type IN ('in','out')),
- qty INTEGER NOT NULL,
- ref TEXT,
- note TEXT,
- user_id INTEGER,
- created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
- FOREIGN KEY(product_id) REFERENCES products(id),
- FOREIGN KEY(user_id) REFERENCES users(id)
-);
-`);
+function hashToken(t){return crypto.createHash('sha256').update(t).digest('hex')}
+function audit(user,action,entity=null,entityId=null,details=null){db.prepare('INSERT INTO audits(user_id,action,entity,entity_id,details) VALUES(?,?,?,?,?)').run(user?.id||null,action,entity,entityId,details?JSON.stringify(details):null)}
+function cookieToken(req){const m=(req.headers.cookie||'').match(/(?:^|; )estoque_session=([^;]+)/);return m?decodeURIComponent(m[1]):null}
+function auth(req,res,next){const raw=cookieToken(req);if(!raw)return res.status(401).json({error:'NÃO AUTENTICADO'});const row=db.prepare('SELECT u.* FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.expires_at>?').get(hashToken(raw),Date.now());if(!row||!row.active)return res.status(401).json({error:'SESSÃO INVÁLIDA OU USUÁRIO BLOQUEADO'});req.user={id:row.id,name:row.name,username:row.username,role:row.role};next()}
+function roles(...rs){return (req,res,next)=>{if(!rs.includes(req.user.role))return res.status(403).json({error:'PERMISSÃO NEGADA'});next()}}
+function clean(s){return String(s??'').trim()}
 
-try { db.prepare("ALTER TABLE users ADD COLUMN active INTEGER NOT NULL DEFAULT 1").run(); } catch(e) {}
-
-const adminName = process.env.ADMIN_NAME || "Red Way";
-const adminPassword = process.env.ADMIN_PASSWORD || "25198615";
-const adminHash = bcrypt.hashSync(adminPassword, 12);
-const existingAdmin = db.prepare("SELECT id FROM users WHERE username=?").get("redway");
-if (!existingAdmin) {
-  db.prepare("INSERT INTO users(name,username,password_hash,role) VALUES(?,?,?,'admin')")
-    .run(adminName, "redway", adminHash);
+const adminUser=process.env.ADMIN_USERNAME||'REDWAY_MASTER';
+const adminPass=process.env.ADMIN_PASSWORD||'RW-9mQ#7vK2!xP4@2026';
+if(!db.prepare('SELECT id FROM users WHERE username=?').get(adminUser)){
+  if(!process.env.ADMIN_PASSWORD) console.warn('Usando a senha inicial padrão. Altere ADMIN_PASSWORD em produção.');
+  db.prepare('INSERT INTO users(name,username,password_hash,role) VALUES(?,?,? ,\'ADMIN\')').run('RED WAY MASTER',adminUser,bcrypt.hashSync(adminPass,12));
+}
+if(db.prepare('SELECT COUNT(*) c FROM products').get().c===0){
+ const seed=[['BOTÃO DE FERRO','PADRÃO',500,100],['COQUINHO','PADRÃO',300,80],['COURINHO','AZUL',120,30],['COURINHO','PRETO',150,30],['COURINHO','MARROM',90,30],['ZÍPER 15 CM','BEGE',200,50],['ZÍPER 15 CM','CAQUI',180,50],['ZÍPER 15 CM','AZUL',150,50],['ZÍPER 15 CM','CINZA',130,50],['ZÍPER 15 CM','PRETO',250,50],['CAIXA DE FÓSFORO','RETA',100,25],['CAIXA DE FÓSFORO','SLIM',100,25],['TAG','PADRÃO',500,100],['LIXA','PADRÃO',40,10],['COLA','PADRÃO',20,5],['SILICONE','PADRÃO',15,5],['FACA','PADRÃO',8,2],['CÓS','PADRÃO',0,0],['REFLETIVO','PADRÃO',0,0],['ETIQUETA DE TAMANHO','PADRÃO',0,0],['ETIQUETA DE COMPOSIÇÃO','PRETA',0,0],['ETIQUETA DE COMPOSIÇÃO','BRANCA',0,0],['ELÁSTICO','PADRÃO',0,0],['CORDÃO','PADRÃO',0,0]];
+ const ins=db.prepare('INSERT INTO products(name,variant,qty,min_qty) VALUES(?,?,?,?)');db.transaction(()=>seed.forEach(x=>ins.run(...x)))();
 }
 
-const count = db.prepare("SELECT COUNT(*) c FROM products").get().c;
-if (!count) {
-  const seed = [
-    ["Botão de ferro","Padrão",500,100],["Coquinho","Padrão",300,80],
-    ["Courinho","Azul",120,30],["Courinho","Preto",150,30],["Courinho","Marrom",90,30],
-    ["Zíper 15 cm","Bege",200,50],["Zíper 15 cm","Caqui",180,50],["Zíper 15 cm","Azul",150,50],
-    ["Zíper 15 cm","Cinza",130,50],["Zíper 15 cm","Preto",250,50],
-    ["Caixa de fósforo","Reta",100,25],["Caixa de fósforo","Slim",100,25],
-    ["Tag","Padrão",500,100],["Lixa","Padrão",40,10],["Cola","Padrão",20,5],
-    ["Silicone","Padrão",15,5],["Faca","Padrão",8,2]
-  ];
-  const ins=db.prepare("INSERT INTO products(name,variant,qty,min_qty) VALUES(?,?,?,?)");
-  const tx=db.transaction(rows=>rows.forEach(r=>ins.run(...r)));
-  tx(seed);
-}
+app.post('/api/login',(req,res)=>{const username=clean(req.body?.username).toUpperCase(),password=String(req.body?.password||'');const u=db.prepare('SELECT * FROM users WHERE username=?').get(username);if(!u||!u.active||!bcrypt.compareSync(password,u.password_hash))return res.status(401).json({error:'USUÁRIO OU SENHA INVÁLIDOS'});const raw=crypto.randomBytes(32).toString('hex');db.prepare('INSERT INTO sessions(token_hash,user_id,expires_at) VALUES(?,?,?)').run(hashToken(raw),u.id,Date.now()+8*60*60*1000);db.prepare('UPDATE users SET last_login=CURRENT_TIMESTAMP WHERE id=?').run(u.id);audit(u,'LOGIN','USER',u.id);const forwardedProto=String(req.headers['x-forwarded-proto']||'').split(',')[0].trim();const secureCookie=req.secure===true||forwardedProto==='https';res.setHeader('Set-Cookie',`estoque_session=${encodeURIComponent(raw)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=28800${secureCookie?'; Secure':''}`);res.json({user:{id:u.id,name:u.name,username:u.username,role:u.role}})});
+app.post('/api/logout',auth,(req,res)=>{const raw=cookieToken(req);db.prepare('DELETE FROM sessions WHERE token_hash=?').run(hashToken(raw));audit(req.user,'LOGOUT');res.setHeader('Set-Cookie','estoque_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0');res.json({ok:true})});
+app.get('/api/me',auth,(req,res)=>res.json({user:req.user}));
 
-function auth(req,res,next){
-  if(!req.session.user) return res.status(401).json({error:"Não autenticado"});
-  next();
-}
-function admin(req,res,next){
-  if(!req.session.user || req.session.user.role!=="admin") return res.status(403).json({error:"Apenas o administrador pode executar esta ação"});
-  next();
-}
+app.get('/api/products',auth,(req,res)=>res.json(db.prepare('SELECT * FROM products ORDER BY name,variant').all()));
+app.post('/api/products',auth,roles('ADMIN'),(req,res)=>{const b=req.body||{};if(!clean(b.name))return res.status(400).json({error:'NOME OBRIGATÓRIO'});const info=db.prepare('INSERT INTO products(name,variant,code,unit,qty,min_qty) VALUES(?,?,?,?,?,?)').run(clean(b.name).toUpperCase(),clean(b.variant||'PADRÃO').toUpperCase(),clean(b.code),clean(b.unit||'UN').toUpperCase(),Number(b.qty)||0,Number(b.min_qty)||0);audit(req.user,'CREATE','PRODUCT',info.lastInsertRowid,b);res.json(db.prepare('SELECT * FROM products WHERE id=?').get(info.lastInsertRowid))});
+app.put('/api/products/:id',auth,roles('ADMIN'),(req,res)=>{const b=req.body||{};db.prepare('UPDATE products SET name=?,variant=?,code=?,unit=?,qty=?,min_qty=? WHERE id=?').run(clean(b.name).toUpperCase(),clean(b.variant||'PADRÃO').toUpperCase(),clean(b.code),clean(b.unit||'UN').toUpperCase(),Number(b.qty)||0,Number(b.min_qty)||0,req.params.id);audit(req.user,'UPDATE','PRODUCT',req.params.id,b);res.json({ok:true})});
+app.delete('/api/products/:id',auth,roles('ADMIN'),(req,res)=>{db.prepare('DELETE FROM products WHERE id=?').run(req.params.id);audit(req.user,'DELETE','PRODUCT',req.params.id);res.json({ok:true})});
 
-app.post("/api/login",(req,res)=>{
-  const {username,password}=req.body||{};
-  const u=db.prepare("SELECT * FROM users WHERE username=?").get(String(username||"").toLowerCase());
-  if(!u || !u.active || !bcrypt.compareSync(String(password||""),u.password_hash))
-    return res.status(401).json({error:"Usuário ou senha incorretos"});
-  req.session.user={id:u.id,name:u.name,username:u.username,role:u.role};
-  res.json({user:req.session.user});
-});
-app.post("/api/logout",(req,res)=>req.session.destroy(()=>res.json({ok:true})));
-app.get("/api/me",(req,res)=>res.json({user:req.session.user||null}));
+function reserved(productId){return db.prepare("SELECT COALESCE(SUM(qty),0) q FROM reservations WHERE product_id=? AND status='ATIVA'").get(productId).q}
+app.get('/api/stock',auth,(req,res)=>{const rows=db.prepare('SELECT * FROM products ORDER BY name,variant').all().map(p=>({...p,reserved:reserved(p.id),available:p.qty-reserved(p.id)}));res.json(rows)});
+app.post('/api/movements',auth,roles('ADMIN','ESTOQUISTA'),(req,res)=>{const b=req.body||{},type=clean(b.type).toUpperCase(),qty=Number(b.qty),p=db.prepare('SELECT * FROM products WHERE id=?').get(b.product_id);if(!p||!['IN','OUT'].includes(type)||!Number.isFinite(qty)||qty<=0)return res.status(400).json({error:'DADOS INVÁLIDOS'});if(type==='OUT'&&(qty>p.qty-reserved(p.id)))return res.status(400).json({error:`DISPONÍVEL INSUFICIENTE. DISPONÍVEL: ${p.qty-reserved(p.id)}`});if(type==='OUT'&&!clean(b.oc))return res.status(400).json({error:'OC É OBRIGATÓRIA NA SAÍDA'});if(type==='OUT'&&!Number.isFinite(Number(b.cut_qty)))return res.status(400).json({error:'QUANTIDADE DE PEÇAS DO CORTE É OBRIGATÓRIA'});const signature=clean(b.signature);if(type==='OUT'&&process.env.REQUIRE_SIGNATURE!=='false'&&!signature)return res.status(400).json({error:'ASSINATURA É OBRIGATÓRIA NA SAÍDA'});const tx=db.transaction(()=>{db.prepare('UPDATE products SET qty=qty+? WHERE id=?').run(type==='IN'?qty:-qty,p.id);const info=db.prepare('INSERT INTO movements(product_id,type,qty,oc,cut_qty,note,user_id,signature) VALUES(?,?,?,?,?,?,?,?)').run(p.id,type,qty,clean(b.oc),Number(b.cut_qty)||null,clean(b.note),req.user.id,signature||null);audit(req.user,type==='IN'?'STOCK_IN':'STOCK_OUT','MOVEMENT',info.lastInsertRowid,b);return info.lastInsertRowid});const id=tx();res.json({ok:true,id})});
+app.get('/api/movements',auth,(req,res)=>res.json(db.prepare(`SELECT m.*,p.name product_name,p.variant,u.name user_name FROM movements m LEFT JOIN products p ON p.id=m.product_id LEFT JOIN users u ON u.id=m.user_id ORDER BY m.id DESC LIMIT 1000`).all()));
 
-app.get("/api/products",auth,(req,res)=>{
-  res.json(db.prepare("SELECT * FROM products ORDER BY name,variant").all());
-});
-app.post("/api/products",admin,(req,res)=>{
-  const {name,variant="Padrão",qty=0,min_qty=0}=req.body||{};
-  if(!name) return res.status(400).json({error:"Nome obrigatório"});
-  const info=db.prepare("INSERT INTO products(name,variant,qty,min_qty) VALUES(?,?,?,?)")
-    .run(name,variant,Number(qty)||0,Number(min_qty)||0);
-  res.json(db.prepare("SELECT * FROM products WHERE id=?").get(info.lastInsertRowid));
-});
-app.put("/api/products/:id",admin,(req,res)=>{
-  const {name,variant="Padrão",qty=0,min_qty=0}=req.body||{};
-  db.prepare("UPDATE products SET name=?,variant=?,qty=?,min_qty=? WHERE id=?")
-    .run(name,variant,Number(qty)||0,Number(min_qty)||0,req.params.id);
-  res.json({ok:true});
-});
-app.delete("/api/products/:id",admin,(req,res)=>{
-  db.prepare("DELETE FROM products WHERE id=?").run(req.params.id);
-  res.json({ok:true});
-});
+app.get('/api/reservations',auth,(req,res)=>res.json(db.prepare(`SELECT r.*,p.name product_name,p.variant,u.name user_name FROM reservations r JOIN products p ON p.id=r.product_id LEFT JOIN users u ON u.id=r.user_id ORDER BY r.id DESC`).all()));
+app.post('/api/reservations',auth,roles('ADMIN','ESTOQUISTA'),(req,res)=>{const oc=clean(req.body?.oc),qty=Number(req.body?.qty),p=db.prepare('SELECT * FROM products WHERE id=?').get(req.body?.product_id);if(!oc||!p||!Number.isFinite(qty)||qty<=0)return res.status(400).json({error:'DADOS INVÁLIDOS'});if(qty>p.qty-reserved(p.id))return res.status(400).json({error:'QUANTIDADE MAIOR QUE O DISPONÍVEL'});const i=db.prepare("INSERT INTO reservations(oc,product_id,qty,user_id) VALUES(?,?,?,?)").run(oc,p.id,qty,req.user.id);audit(req.user,'RESERVE','RESERVATION',i.lastInsertRowid,{oc,qty,product:p.name});res.json({ok:true,id:i.lastInsertRowid})});
+app.post('/api/reservations/:id/cancel',auth,roles('ADMIN','ESTOQUISTA'),(req,res)=>{db.prepare("UPDATE reservations SET status='CANCELADA',cancelled_at=CURRENT_TIMESTAMP WHERE id=? AND status='ATIVA'").run(req.params.id);audit(req.user,'CANCEL_RESERVATION','RESERVATION',req.params.id);res.json({ok:true})});
 
-app.post("/api/movements",admin,(req,res)=>{
-  const {product_id,type,qty,ref="",note=""}=req.body||{};
-  const n=Number(qty);
-  if(!product_id || !["in","out"].includes(type) || !Number.isInteger(n) || n<=0)
-    return res.status(400).json({error:"Dados de movimentação inválidos"});
-  const p=db.prepare("SELECT * FROM products WHERE id=?").get(product_id);
-  if(!p) return res.status(404).json({error:"Produto não encontrado"});
-  if(type==="out" && n>p.qty) return res.status(400).json({error:"Estoque insuficiente"});
-  const change=type==="in"?n:-n;
-  const tx=db.transaction(()=>{
-    db.prepare("UPDATE products SET qty=qty+? WHERE id=?").run(change,product_id);
-    db.prepare("INSERT INTO movements(product_id,type,qty,ref,note,user_id) VALUES(?,?,?,?,?,?)")
-      .run(product_id,type,n,ref,note,req.session.user.id);
-  });
-  tx();
-  res.json({ok:true});
-});
-app.get("/api/movements",auth,(req,res)=>{
-  res.json(db.prepare(`
-    SELECT m.*,p.name product_name,p.variant,u.name user_name
-    FROM movements m LEFT JOIN products p ON p.id=m.product_id
-    LEFT JOIN users u ON u.id=m.user_id
-    ORDER BY m.id DESC LIMIT 500
-  `).all());
-});
-app.delete("/api/movements",admin,(req,res)=>{
-  db.prepare("DELETE FROM movements").run();
-  res.json({ok:true});
-});
+app.get('/api/users',auth,roles('ADMIN'),(req,res)=>res.json(db.prepare('SELECT id,name,username,role,active,created_at,last_login FROM users ORDER BY name').all()));
+app.post('/api/users',auth,roles('ADMIN'),(req,res)=>{const b=req.body||{};if(!clean(b.name)||!clean(b.username)||!b.password||!['ADMIN','ESTOQUISTA','CONSULTA'].includes(b.role))return res.status(400).json({error:'DADOS INVÁLIDOS'});try{const i=db.prepare('INSERT INTO users(name,username,password_hash,role) VALUES(?,?,?,?)').run(clean(b.name),clean(b.username).toUpperCase(),bcrypt.hashSync(String(b.password),12),b.role);audit(req.user,'CREATE','USER',i.lastInsertRowid,{username:b.username,role:b.role});res.json({id:i.lastInsertRowid})}catch(e){res.status(400).json({error:'USUÁRIO JÁ EXISTE'})}});
+app.post('/api/users/:id/toggle',auth,roles('ADMIN'),(req,res)=>{const u=db.prepare('SELECT * FROM users WHERE id=?').get(req.params.id);if(!u)return res.status(404).json({error:'USUÁRIO NÃO ENCONTRADO'});if(u.id===req.user.id&&u.active)return res.status(400).json({error:'NÃO É POSSÍVEL BLOQUEAR O PRÓPRIO USUÁRIO'});db.prepare('UPDATE users SET active=? WHERE id=?').run(u.active?0:1,u.id);db.prepare('DELETE FROM sessions WHERE user_id=?').run(u.id);audit(req.user,u.active?'BLOCK_USER':'UNBLOCK_USER','USER',u.id);res.json({ok:true})});
+app.put('/api/users/:id/password',auth,roles('ADMIN'),(req,res)=>{if(!req.body?.password)return res.status(400).json({error:'SENHA OBRIGATÓRIA'});db.prepare('UPDATE users SET password_hash=? WHERE id=?').run(bcrypt.hashSync(String(req.body.password),12),req.params.id);db.prepare('DELETE FROM sessions WHERE user_id=?').run(req.params.id);audit(req.user,'RESET_PASSWORD','USER',req.params.id);res.json({ok:true})});
 
-app.put("/api/me/password",auth,(req,res)=>{
-  const {currentPassword,newPassword}=req.body||{};
-  if(!currentPassword || !newPassword || String(newPassword).length < 6) return res.status(400).json({error:"A nova senha deve ter pelo menos 6 caracteres"});
-  const u=db.prepare("SELECT * FROM users WHERE id=?").get(req.session.user.id);
-  if(!u || !bcrypt.compareSync(String(currentPassword),u.password_hash)) return res.status(400).json({error:"Senha atual incorreta"});
-  db.prepare("UPDATE users SET password_hash=? WHERE id=?").run(bcrypt.hashSync(String(newPassword),12),u.id);
-  res.json({ok:true});
-});
-app.get("/api/users",admin,(req,res)=>{
-  res.json(db.prepare("SELECT id,name,username,role,active,created_at FROM users ORDER BY name").all());
-});
-app.post("/api/users",admin,(req,res)=>{
-  const {name,username,password,role="user"}=req.body||{};
-  if(!name||!username||!password||!["admin","user"].includes(role))
-    return res.status(400).json({error:"Dados inválidos"});
-  try {
-    const hash=bcrypt.hashSync(password,12);
-    const info=db.prepare("INSERT INTO users(name,username,password_hash,role) VALUES(?,?,?,?)")
-      .run(name,String(username).toLowerCase(),hash,role);
-    res.json({id:info.lastInsertRowid});
-  } catch(e){res.status(400).json({error:"Usuário já existe"});}
-});
-app.put("/api/users/:id/password",admin,(req,res)=>{
-  const {password}=req.body||{};
-  if(!password || String(password).length < 6) return res.status(400).json({error:"Senha deve ter pelo menos 6 caracteres"});
-  db.prepare("UPDATE users SET password_hash=? WHERE id=?").run(bcrypt.hashSync(String(password),12),req.params.id);
-  res.json({ok:true});
-});
-app.put("/api/users/:id/status",admin,(req,res)=>{
-  const id=Number(req.params.id), active=req.body?.active ? 1 : 0;
-  if(id===req.session.user.id && !active) return res.status(400).json({error:"Você não pode bloquear seu próprio usuário"});
-  const u=db.prepare("SELECT id,role FROM users WHERE id=?").get(id);
-  if(!u) return res.status(404).json({error:"Usuário não encontrado"});
-  if(u.role==="admin" && !active && db.prepare("SELECT COUNT(*) c FROM users WHERE role='admin' AND active=1").get().c<=1) return res.status(400).json({error:"É necessário manter pelo menos um administrador ativo"});
-  db.prepare("UPDATE users SET active=? WHERE id=?").run(active,id); res.json({ok:true});
-});
-app.delete("/api/users/:id",admin,(req,res)=>{
-  const id=Number(req.params.id); if(id===req.session.user.id) return res.status(400).json({error:"Você não pode excluir seu próprio usuário"});
-  const u=db.prepare("SELECT id,role FROM users WHERE id=?").get(id); if(!u) return res.status(404).json({error:"Usuário não encontrado"});
-  if(u.role==="admin" && db.prepare("SELECT COUNT(*) c FROM users WHERE role='admin'").get().c<=1) return res.status(400).json({error:"É necessário manter pelo menos um administrador"});
-  db.prepare("DELETE FROM users WHERE id=?").run(id); res.json({ok:true});
-});
+app.get('/api/fichas',auth,(req,res)=>res.json(db.prepare('SELECT f.*,u.name created_by_name FROM fichas f LEFT JOIN users u ON u.id=f.created_by ORDER BY f.id DESC').all().map(x=>({...x,data:JSON.parse(x.data_json||'{}')}))));
+app.post('/api/fichas',auth,roles('ADMIN','ESTOQUISTA'),(req,res)=>{const b=req.body||{};try{const i=db.prepare('INSERT INTO fichas(number,oc,office,description,pieces,status,data_json,created_by) VALUES(?,?,?,?,?,?,?,?)').run(clean(b.number)||null,clean(b.oc),clean(b.office),clean(b.description),Number(b.pieces)||0,clean(b.status||'EM ABERTO'),JSON.stringify(b.data||{}),req.user.id);audit(req.user,'CREATE','FICHA',i.lastInsertRowid,{oc:b.oc});res.json({id:i.lastInsertRowid})}catch(e){res.status(400).json({error:'NÚMERO DA FICHA JÁ EXISTE'})}});
+app.put('/api/fichas/:id',auth,roles('ADMIN','ESTOQUISTA'),(req,res)=>{const b=req.body||{};db.prepare('UPDATE fichas SET number=?,oc=?,office=?,description=?,pieces=?,status=?,data_json=?,updated_at=CURRENT_TIMESTAMP WHERE id=?').run(clean(b.number),clean(b.oc),clean(b.office),clean(b.description),Number(b.pieces)||0,clean(b.status||'EM ABERTO'),JSON.stringify(b.data||{}),req.params.id);audit(req.user,'UPDATE','FICHA',req.params.id,{oc:b.oc,status:b.status});res.json({ok:true})});
+app.post('/api/fichas/:id/status',auth,roles('ADMIN','ESTOQUISTA'),(req,res)=>{const s=clean(req.body?.status).toUpperCase();const allowed=['EM ABERTO','EM CORTE','EM OFICINA','EM LAVANDERIA','EM ACABAMENTO','FINALIZADA','COM PENDÊNCIA'];if(!allowed.includes(s))return res.status(400).json({error:'STATUS INVÁLIDO'});db.prepare('UPDATE fichas SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?').run(s,req.params.id);audit(req.user,'STATUS','FICHA',req.params.id,{status:s});res.json({ok:true})});
 
+app.post('/api/signatures',auth,(req,res)=>{const sig=clean(req.body?.signature);if(!sig||sig.length>1000000)return res.status(400).json({error:'ASSINATURA INVÁLIDA'});res.json({ok:true,signature:sig})});
+app.get('/api/audit',auth,roles('ADMIN'),(req,res)=>res.json(db.prepare(`SELECT a.*,u.name user_name,u.username FROM audits a LEFT JOIN users u ON u.id=a.user_id ORDER BY a.id DESC LIMIT 2000`).all()));
 
-// Assistente de IA para consultar o estoque e interpretar comandos em linguagem natural.
-// A chave da OpenAI fica somente no servidor (nunca no navegador).
-let openai = null;
-if (process.env.OPENAI_API_KEY) openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+function snapshot(){const products=db.prepare('SELECT * FROM products').all();const reservations=db.prepare("SELECT * FROM reservations WHERE status='ATIVA'").all();const fichas=db.prepare('SELECT * FROM fichas').all();const pending=db.prepare("SELECT COUNT(*) c FROM occurrences WHERE status='ABERTA'").get().c;return {products,reservations,fichas,pending}}
 
-app.post("/api/assistant", auth, async (req,res)=>{
-  if(!openai) return res.status(503).json({error:"A IA ainda não foi configurada. Adicione OPENAI_API_KEY nas variáveis do servidor."});
-  const message=String(req.body?.message||"").trim();
-  if(!message) return res.status(400).json({error:"Comando vazio"});
-  if(message.length>1000) return res.status(400).json({error:"Comando muito longo"});
+async function aiCall(instruction){if(!process.env.OPENAI_API_KEY)throw new Error('OPENAI_API_KEY NÃO CONFIGURADA');const model=process.env.OPENAI_MODEL||'gpt-5.6-luna';const context=snapshot();const body={model,input:[{role:'system',content:[{type:'input_text',text:`Você é a assistente do Estoque Pro. Responda em português brasileiro, seja objetiva e nunca invente dados. Você recebe o estado atual do sistema. Para comandos, devolva SOMENTE JSON válido no formato {"message":"...","action":null|{"type":"...","...":...},"needs_confirmation":true|false}. Ações permitidas: QUERY_STOCK, QUERY_OC, CREATE_RESERVATION, STOCK_IN, STOCK_OUT, CREATE_FICHA, UPDATE_FICHA_STATUS. Nunca proponha STOCK_OUT sem OC e cut_qty. Nunca execute ação; apenas proponha. Para perguntas, action=null.`},{type:'input_text',text:`ESTADO ATUAL:\n${JSON.stringify(context)}\n\nPEDIDO:\n${instruction}`}]}],text:{format:{type:'json_object'}}};const r=await fetch('https://api.openai.com/v1/responses',{method:'POST',headers:{'Authorization':`Bearer ${process.env.OPENAI_API_KEY}`,'Content-Type':'application/json'},body:JSON.stringify(body)});if(!r.ok)throw new Error(`IA indisponível (${r.status})`);const j=await r.json();const out=j.output?.flatMap(x=>x.content||[]).find(x=>x.type==='output_text')?.text||j.output_text;if(!out)throw new Error('IA não retornou uma resposta');return JSON.parse(out)}
+app.post('/api/ai/command',auth,async(req,res)=>{try{const result=await aiCall(clean(req.body?.text));audit(req.user,'AI_COMMAND',null,null,{text:req.body?.text,action:result.action?.type||null});res.json(result)}catch(e){res.status(400).json({error:e.message})}});
+app.post('/api/ai/execute',auth,roles('ADMIN','ESTOQUISTA'),(req,res)=>{const a=req.body?.action;if(!a?.type)return res.status(400).json({error:'AÇÃO AUSENTE'});try{let result;const tx=db.transaction(()=>{switch(a.type){case 'STOCK_IN':{const p=db.prepare('SELECT * FROM products WHERE id=?').get(a.product_id);if(!p)throw Error('PRODUTO NÃO ENCONTRADO');const q=Number(a.qty);if(!(q>0))throw Error('QUANTIDADE INVÁLIDA');db.prepare('UPDATE products SET qty=qty+? WHERE id=?').run(q,p.id);result={message:`Entrada de ${q} UN registrada.`};break}case 'STOCK_OUT':{const p=db.prepare('SELECT * FROM products WHERE id=?').get(a.product_id);const q=Number(a.qty),cut=Number(a.cut_qty);if(!p)throw Error('PRODUTO NÃO ENCONTRADO');if(!a.oc||!(cut>0))throw Error('SAÍDA EXIGE OC E QUANTIDADE DO CORTE');if(q>p.qty-reserved(p.id))throw Error('ESTOQUE DISPONÍVEL INSUFICIENTE');db.prepare('UPDATE products SET qty=qty-? WHERE id=?').run(q,p.id);db.prepare('INSERT INTO movements(product_id,type,qty,oc,cut_qty,note,user_id) VALUES(?,?,?,?,?,?,?)').run(p.id,'OUT',q,a.oc,cut,a.note||'COMANDO DE IA',req.user.id);result={message:`Saída de ${q} UN registrada para a OC ${a.oc}.`};break}case 'CREATE_RESERVATION':{const p=db.prepare('SELECT * FROM products WHERE id=?').get(a.product_id),q=Number(a.qty);if(!p||!a.oc||!(q>0))throw Error('DADOS DE RESERVA INVÁLIDOS');if(q>p.qty-reserved(p.id))throw Error('DISPONÍVEL INSUFICIENTE');db.prepare('INSERT INTO reservations(oc,product_id,qty,user_id) VALUES(?,?,?,?)').run(a.oc,p.id,q,req.user.id);result={message:`Reserva de ${q} UN criada para a OC ${a.oc}.`};break}case 'CREATE_FICHA':{const i=db.prepare('INSERT INTO fichas(number,oc,office,description,pieces,status,data_json,created_by) VALUES(?,?,?,?,?,?,?,?)').run(clean(a.number)||null,clean(a.oc),clean(a.office),clean(a.description),Number(a.pieces)||0,'EM ABERTO','{}',req.user.id);result={message:`Ficha ${a.number||i.lastInsertRowid} criada.`};break}case 'UPDATE_FICHA_STATUS':{const s=clean(a.status).toUpperCase();db.prepare('UPDATE fichas SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?').run(s,a.ficha_id);result={message:`Ficha atualizada para ${s}.`};break}default:throw Error('AÇÃO NÃO PERMITIDA')}});tx();audit(req.user,'AI_EXECUTE',a.type,null,a);res.json({ok:true,...result})}catch(e){res.status(400).json({error:e.message})}});
 
-  const products=db.prepare("SELECT id,name,variant,qty,min_qty FROM products WHERE active=1 ORDER BY name,variant").all();
-  const context=products.map(p=>({id:p.id,name:p.name,variant:p.variant,qty:p.qty,min_qty:p.min_qty}));
-  const isAdmin=req.session.user.role==="admin";
-  const instructions=`Você é o assistente do Estoque Pro. Responda em português do Brasil, de forma curta e clara.\n\nUsuário atual: ${req.session.user.name} (${isAdmin?"administrador":"usuário comum"}).\n\nProdutos atuais (JSON): ${JSON.stringify(context)}\n\nRegras:\n- Você pode consultar estoque para qualquer usuário autenticado.\n- Somente administrador pode registrar entrada/saída e criar produto.\n- Nunca invente produto, quantidade ou ID.\n- Para movimentação, identifique o produto pelo nome/variação usando apenas a lista fornecida.\n- Se houver ambiguidade entre produtos, peça esclarecimento e não execute ação.\n- Uma saída não pode ultrapassar o estoque disponível.\n- Não altere estoque apenas porque o usuário perguntou; só proponha uma ação quando houver pedido explícito.\n- Se o usuário pedir algo fora do sistema de estoque, explique que pode ajudar com o estoque, usuários e movimentações.\n- A ação retornada será validada pelo servidor; nunca tente contornar permissões.`;
-
-  try{
-    const response=await openai.responses.create({
-      model:process.env.OPENAI_MODEL||"gpt-5.6-luna",
-      instructions,
-      input:message,
-      store:false,
-      text:{format:{type:"json_schema",name:"estoque_assistant",strict:true,schema:{
-        type:"object",additionalProperties:false,
-        properties:{
-          action:{type:"string",enum:["answer","move","create_product"]},
-          reply:{type:"string"},
-          product_id:{type:["integer","null"]},
-          movement_type:{type:["string","null"],enum:["in","out",null]},
-          quantity:{type:["integer","null"]},
-          reference:{type:["string","null"]},
-          note:{type:["string","null"]},
-          product_name:{type:["string","null"]},
-          variant:{type:["string","null"]}
-        },required:["action","reply","product_id","movement_type","quantity","reference","note","product_name","variant"]
-      }}}
-    });
-    const parsed=JSON.parse(response.output_text);
-    if(parsed.action==="move"){
-      if(!isAdmin) return res.json({action:"answer",reply:"Você pode consultar o estoque por voz, mas somente o administrador pode registrar entradas e saídas."});
-      const p=parsed.product_id?db.prepare("SELECT * FROM products WHERE id=? AND active=1").get(parsed.product_id):null;
-      const n=Number(parsed.quantity);
-      if(!p || !["in","out"].includes(parsed.movement_type) || !Number.isInteger(n) || n<=0)
-        return res.json({action:"answer",reply:"Não consegui identificar com segurança o produto e a quantidade. Tente dizer, por exemplo: 'dar entrada de 100 botões de ferro'."});
-      if(parsed.movement_type==="out" && n>p.qty) return res.json({action:"answer",reply:`Não posso registrar a saída de ${n} unidades de ${p.name} ${p.variant}, porque há apenas ${p.qty} no estoque.`});
-    }
-    if(parsed.action==="create_product" && !isAdmin) return res.json({action:"answer",reply:"Somente o administrador pode cadastrar produtos."});
-    if(parsed.action==="create_product"){
-      const name=String(parsed.product_name||"").trim(), variant=String(parsed.variant||"Padrão").trim();
-      const n=Number(parsed.quantity||0);
-      if(!name) return res.json({action:"answer",reply:"Diga o nome do produto que deseja cadastrar."});
-      return res.json({action:"create_product",reply:parsed.reply||`Confirma o cadastro de ${name} — ${variant}?`,product_name:name,variant,quantity:Number.isInteger(n)&&n>=0?n:0});
-    }
-    if(parsed.action==="move"){
-      return res.json({action:"move",reply:parsed.reply||"Confirme a movimentação.",product_id:parsed.product_id,movement_type:parsed.movement_type,quantity:parsed.quantity,reference:parsed.reference||"",note:parsed.note||""});
-    }
-    res.json({action:"answer",reply:parsed.reply||"Não encontrei uma resposta."});
-  }catch(e){
-    console.error("AI error",e);
-    res.status(502).json({error:"Não foi possível consultar a IA agora."});
-  }
-});
-
-app.post("/api/assistant/execute-move",admin,(req,res)=>{
-  const {product_id,type,qty,ref="",note=""}=req.body||{};
-  const n=Number(qty); if(!product_id||!["in","out"].includes(type)||!Number.isInteger(n)||n<=0) return res.status(400).json({error:"Movimentação inválida"});
-  const p=db.prepare("SELECT * FROM products WHERE id=? AND active=1").get(product_id); if(!p) return res.status(404).json({error:"Produto não encontrado"});
-  if(type==="out"&&n>p.qty) return res.status(400).json({error:"Estoque insuficiente"});
-  const change=type==="in"?n:-n;
-  const tx=db.transaction(()=>{db.prepare("UPDATE products SET qty=qty+? WHERE id=?").run(change,product_id);db.prepare("INSERT INTO movements(product_id,type,qty,ref,note,user_id) VALUES(?,?,?,?,?,?)").run(product_id,type,n,ref,note,req.session.user.id)}); tx();
-  res.json({ok:true});
-});
-
-app.post("/api/assistant/execute-product",admin,(req,res)=>{
-  const {name,variant="Padrão",qty=0,min_qty=0}=req.body||{};
-  if(!name) return res.status(400).json({error:"Nome obrigatório"});
-  const info=db.prepare("INSERT INTO products(name,variant,qty,min_qty) VALUES(?,?,?,?)").run(String(name).trim(),String(variant).trim()||"Padrão",Number(qty)||0,Number(min_qty)||0);
-  res.json(db.prepare("SELECT * FROM products WHERE id=?").get(info.lastInsertRowid));
-});
-
-app.listen(PORT,()=>console.log(`Estoque Pro rodando em http://localhost:${PORT}`));
+app.get('/health',(req,res)=>res.json({ok:true,service:'estoque-pro-v12'}));
+app.listen(PORT,'0.0.0.0',()=>console.log(`Estoque Pro V12 rodando na porta ${PORT}`));
